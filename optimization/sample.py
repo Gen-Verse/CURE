@@ -38,7 +38,7 @@ def worker_fn(pretrained_model, gpu_ids, task_queue, result_queue, max_model_len
 
     sampling_params = SamplingParams(
         temperature=temp,
-        top_p=1.0,
+        top_p=0.95,
         top_k=-1,
         min_p=0.0,
         max_tokens=max_generation_token,
