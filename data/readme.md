@@ -5,13 +5,13 @@
 The training data is `CodeContests_train`, the evaluation datasets are `LiveBench`, `CodeContests`, `LiveCodeBench`, `CodeForces` and `MBPP`. You can simply download them by
 ```bash
 # download the evaluation data
-python download_dataset.py --dataset LiveBench
-python download_dataset.py --dataset CodeContests
-python download_dataset.py --dataset LiveCodeBench
-python download_dataset.py --dataset CodeForces
-python download_dataset.py --dataset MBPP
+python download_data.py --dataset LiveBench-ReasonFlux
+python download_data.py --dataset CodeContests
+python download_data.py --dataset LiveCodeBench-ReasonFlux
+python download_data.py --dataset CodeForces
+python download_data.py --dataset MBPP-ReasonFlux
 # download the training data
-python download_dataset.py --dataset CodeContests_train
+python download_data.py --dataset CodeContests_train
 ```
 
 We use Stdio input/output format here. For example, for the task to calculate the sum of a list, the input and output are in the following format:
