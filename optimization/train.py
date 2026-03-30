@@ -69,7 +69,8 @@ class PPOExpConfig(BasePPOExpConfig):
     os.makedirs(os.path.dirname("./ckpt"), exist_ok=True)
     ckpt_path: str = f"ckpt"
     save_path: str = f"ckpt"
-    tensorboard_log_dir: str = f"ckpt"
+    os.makedirs("./tb_logs", exist_ok=True)
+    tensorboard_log_dir: str = f"tb_logs"
 
     # ppo related settings
     actor_learning_rate: float = optimization_config.actor_learning_rate
@@ -117,6 +118,8 @@ if __name__ == "__main__":
     import argparse, sys, asyncio, os
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrain", type=str)
+    parser.add_argument("--step", type=int, default=0)
+    parser.add_argument("--tb_dir", type=str, default=None)
     args, unknown = parser.parse_known_args()
 
     sys.argv = [sys.argv[0]] + unknown
@@ -124,6 +127,9 @@ if __name__ == "__main__":
     cfg = PPOExpConfig()
     if args.pretrain is not None:
         cfg.pretrain = args.pretrain
+    cfg.global_step = args.step
+    if args.tb_dir is not None:
+        cfg.tensorboard_log_dir = args.tb_dir
 
     exp = PPOExp().set_cfg(cfg)
     

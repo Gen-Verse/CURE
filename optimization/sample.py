@@ -200,9 +200,11 @@ def get_scaling_prompt(data_i, method):
     if method == "sample":
         return Template(system_prompts).render(language = "python", special_requirements = special_requirements, problem = problem)
     if method == "case":
-        n_example = len(data_i["example_input"])
-        example_input = ", ".join([repr(item) for item in data_i['example_input']])
-        example_output = ", ".join([repr(item) for item in data_i['example_output']])
+        example_inputs = data_i.get("example_input", [])
+        example_outputs = data_i.get("example_output", [])
+        n_example = len(example_inputs)
+        example_input = ", ".join([repr(item) for item in example_inputs])
+        example_output = ", ".join([repr(item) for item in example_outputs])
         if n_example == 0:
             example_intro = """ """
         if n_example == 1:
@@ -283,6 +285,10 @@ code_index = []
 case_generation_prompts = []
 case_index = []
 for i in range(num):
+    data[i].setdefault("test_input", [])
+    data[i].setdefault("test_output", [])
+    data[i].setdefault("example_input", [])
+    data[i].setdefault("example_output", [])
     # preprocess
     data[i]["full_code_generation"] = []
     data[i]["code_response_length"] = []
@@ -414,7 +420,6 @@ with open("./temp_data/outputs-" + outputs_name + ".json", "w", encoding="utf-8"
 
 
 stop_workers(task_queues, processes)
-
 
 
 

@@ -423,7 +423,6 @@ class PolicyRayActorBase(RayActor):
         return policy_logprob.to("cpu")
 
     def ppo_train(self, global_steps, replay_buffer):
-        # replay buffer may be empty at first, we should rebuild at each training
         device = torch.cuda.current_device()
         dataloader = DataLoader(
             replay_buffer,
@@ -450,16 +449,34 @@ class PolicyRayActorBase(RayActor):
                 status = self.training_step(experience, global_steps, local_step, accumulation_steps)
                 policy_update_steps += 1
 
+                status = self.strategy.all_reduce(status)
+                short_status = {
+                    "pg": status["policy_loss"],
+                    "kl": status["kl_loss"],
+                    "clip": status["clip_ratio"],
+                    "ent": status["entropy"],
+                }
+                status_list.append(status)
+                pbar.set_postfix(short_status)
+
                 if (local_step + 1) // accumulation_steps == update_steps:
                     break
 
         torch.distributed.barrier()
 
+        if status_list:
+            status_mean = status_list[0]
+            for m in status_list[1:]:
+                for k, v in m.items():
+                    status_mean[k] += v
+            for k in status_mean.keys():
+                status_mean[k] /= len(status_list)
+        status_mean["policy_update_steps"] = policy_update_steps / max(accumulation_steps, 1)
+        return status_mean
 
     def training_step(self, experience: Experience, global_steps, local_step, accumulation_steps) -> Dict[str, float]:
         self.model.train()
 
-        # TODO: only support packed sequences for now
         assert isinstance(experience.sequences, list)
         sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
         base_action_log_probs = torch.cat(experience.base_action_log_probs, dim=0).unsqueeze(0)
@@ -467,8 +484,7 @@ class PolicyRayActorBase(RayActor):
         num_actions = torch.cat(experience.num_actions, dim=0).long().tolist()
         packed_seq_lens = torch.cat(experience.packed_seq_lens, dim=0).long().tolist()
         attention_mask = torch.cat(experience.attention_mask, dim=0).unsqueeze(0)
-        
-        # actor loss
+
         action_log_probs, output = self.model(
             sequences,
             num_actions,
@@ -477,8 +493,6 @@ class PolicyRayActorBase(RayActor):
             packed_seq_lens=packed_seq_lens,
         )
 
-        # loss function
-        # TODO: recompute advantages
         actor_loss = self.actor_loss_fn(
             action_log_probs,
             base_action_log_probs,
@@ -486,7 +500,39 @@ class PolicyRayActorBase(RayActor):
             action_mask=experience.action_mask,
         )
 
-        # kl loss
+        with torch.no_grad():
+            ratio = (action_log_probs - base_action_log_probs).exp()
+            clamp_ratio = ratio.clamp(1 - self.actor_loss_fn.clip_eps, 1 + self.actor_loss_fn.clip_eps)
+            clip_ratio = (clamp_ratio != ratio).sum().item() / max(ratio.numel(), 1)
+
+        with torch.no_grad():
+            assert isinstance(experience.sequences, list)
+            action_logits = output["logits"][:, :-1, :]
+            action_log_probs_all = torch.nn.functional.log_softmax(action_logits, dim=-1)
+
+            action_log_probs_all_list = []
+            offset = 0
+            for num_action, seq_len in zip(num_actions, packed_seq_lens):
+                start = max(0, offset + seq_len - num_action - 1)
+                end = offset + seq_len - 1
+                action_log_probs_all_list.append(action_log_probs_all[:, start:end])
+                offset += seq_len
+            action_log_probs_all = torch.cat(action_log_probs_all_list, dim=1)
+
+            chunk_size = 512
+            num_chunks = (action_log_probs_all.size(1) + chunk_size - 1) // chunk_size
+            entropy_sum = 0
+            total_tokens = 0
+            for ci in range(num_chunks):
+                s_idx = ci * chunk_size
+                e_idx = min((ci + 1) * chunk_size, action_log_probs_all.size(1))
+                chunk = action_log_probs_all[:, s_idx:e_idx]
+                chunk_probs = chunk.exp()
+                chunk_entropy = -(chunk_probs * chunk).sum(-1)
+                entropy_sum += chunk_entropy.sum().item()
+                total_tokens += chunk_entropy.numel()
+            entropy = entropy_sum / max(total_tokens, 1)
+
         if self.args.use_kl_loss:
             kl_loss = action_log_probs - base_action_log_probs
             if self.args.use_kl_estimator_k3:
@@ -495,7 +541,7 @@ class PolicyRayActorBase(RayActor):
                 kl_loss = r - 1.0 - kl_loss
             kl_loss = masked_mean(kl_loss, experience.action_mask, dim=-1).mean()
         else:
-            kl_loss = 0
+            kl_loss = torch.tensor(0.0)
 
         loss = actor_loss + kl_loss * self.args.kl_loss_coef
         loss = loss / accumulation_steps
@@ -504,7 +550,25 @@ class PolicyRayActorBase(RayActor):
         if (local_step + 1) % accumulation_steps == 0:
             self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
-        return 
+        kl_loss_val = kl_loss.item() if torch.is_tensor(kl_loss) else kl_loss
+
+        status = {
+            "policy_loss": actor_loss.item(),
+            "kl_loss": kl_loss_val,
+            "total_loss": loss.item() * accumulation_steps,
+            "clip_ratio": clip_ratio,
+            "entropy": entropy,
+            "actor_lr": self.scheduler.get_last_lr()[0],
+            "response_length": experience.info["response_length"].mean().item(),
+            "total_length": experience.info["total_length"].mean().item(),
+        }
+
+        if "group_raw_reward" in experience.info:
+            status["group_raw_reward"] = experience.info["group_raw_reward"].mean().item()
+            status["group_relative_reward"] = experience.info["group_relative_reward"].mean().item()
+            status["group_reward_std"] = experience.info["group_reward_std"].mean().item()
+
+        return status
 
     def process_sequences(self, sequences, input_len, eos_token_id, pad_token_id):
         return self.model.process_sequences(sequences, input_len, eos_token_id, pad_token_id)

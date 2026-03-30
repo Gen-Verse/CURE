@@ -12,7 +12,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+try:
+    from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+except Exception:
+    FusedAdam = None
+    DeepSpeedCPUAdam = None
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from peft import PeftModel, get_peft_model_state_dict
 from torch import distributed as dist

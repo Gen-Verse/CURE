@@ -27,6 +27,7 @@ from train_utils.utils import (
     masked_mean,
     normalize_advantages,
 )
+from reporting import append_jsonl, get_profile_name
 
 
 class RayPPOTrainer:
@@ -43,6 +44,7 @@ class RayPPOTrainer:
         self.colocate_pg = colocate_pg
 
         self.writer = SummaryWriter(log_dir=self.cfg.tensorboard_log_dir)
+        self.global_step = getattr(self.cfg, 'global_step', 0)
         self.replay_buffer = NaiveReplayBuffer(
             sample_batch_size=self.cfg.micro_train_batch_size,
             limit=0,
@@ -60,17 +62,20 @@ class RayPPOTrainer:
 
         if self.cfg.separate_training == True:
             train_data_list = [self.cfg.rl_code_data, self.cfg.rl_case_data]
+            data_tags = ["code", "case"]
         else:
             train_data_list = [self.cfg.rl_data]
-        
-        for data_name in train_data_list:
+            data_tags = ["all"]
 
-            logger.info(f"Training with {data_name}")
+        for data_idx, data_name in enumerate(train_data_list):
+            tag = data_tags[data_idx]
+
+            logger.info(f"Training with {data_name} (tag={tag}, global_step={self.global_step})")
 
             with open(data_name, 'r') as f:
                 rl_data = json.load(f)
 
-            await self.make_experience(rl_data)
+            await self.make_experience(rl_data, tag=tag)
 
             num_policy_dp_nodes = self.cfg.actor_num_nodes * self.cfg.actor_num_gpus_per_node
             num_critic_dp_nodes = self.cfg.critic_num_nodes * self.cfg.critic_num_gpus_per_node
@@ -78,9 +83,50 @@ class RayPPOTrainer:
 
             async with Timer("Actor model training"):
                 await self.policy_model.backload_to_gpu()
-                await self.ppo_local_train_policy(policy_buffers, 1)
+                train_status = await self.ppo_local_train_policy(policy_buffers, 1)
                 await self.policy_model.offload_to_cpu()
-            
+
+            if train_status:
+                step_key = self.global_step
+                self.writer.add_scalar(f"train/{tag}/policy_loss", train_status.get("policy_loss", 0), step_key)
+                self.writer.add_scalar(f"train/{tag}/kl_loss", train_status.get("kl_loss", 0), step_key)
+                self.writer.add_scalar(f"train/{tag}/total_loss", train_status.get("total_loss", 0), step_key)
+                self.writer.add_scalar(f"train/{tag}/clip_ratio", train_status.get("clip_ratio", 0), step_key)
+                self.writer.add_scalar(f"train/{tag}/entropy", train_status.get("entropy", 0), step_key)
+                self.writer.add_scalar(f"train/{tag}/actor_lr", train_status.get("actor_lr", 0), step_key)
+                self.writer.add_scalar(f"train/{tag}/policy_update_steps", train_status.get("policy_update_steps", 0), step_key)
+                if "group_raw_reward" in train_status:
+                    self.writer.add_scalar(f"train/{tag}/group_raw_reward", train_status["group_raw_reward"], step_key)
+                    self.writer.add_scalar(f"train/{tag}/group_relative_reward", train_status["group_relative_reward"], step_key)
+                logger.info(
+                    f"[step={self.global_step} tag={tag}] "
+                    f"policy_loss={train_status.get('policy_loss', 0):.4f}, "
+                    f"kl_loss={train_status.get('kl_loss', 0):.4f}, "
+                    f"clip_ratio={train_status.get('clip_ratio', 0):.4f}, "
+                    f"entropy={train_status.get('entropy', 0):.4f}, "
+                    f"lr={train_status.get('actor_lr', 0):.2e}"
+                )
+                append_jsonl(
+                    "policy_metrics.jsonl",
+                    {
+                        "step": step_key,
+                        "profile": get_profile_name(),
+                        "tag": tag,
+                        "policy_loss": train_status.get("policy_loss", 0),
+                        "kl_loss": train_status.get("kl_loss", 0),
+                        "total_loss": train_status.get("total_loss", 0),
+                        "clip_ratio": train_status.get("clip_ratio", 0),
+                        "entropy": train_status.get("entropy", 0),
+                        "actor_lr": train_status.get("actor_lr", 0),
+                        "policy_update_steps": train_status.get("policy_update_steps", 0),
+                        "group_raw_reward": train_status.get("group_raw_reward", 0),
+                        "group_relative_reward": train_status.get("group_relative_reward", 0),
+                        "group_reward_std": train_status.get("group_reward_std", 0),
+                        "metric_type": "policy",
+                    },
+                )
+                self.writer.flush()
+
             self.replay_buffer.clear()
 
         await self.policy_model.async_save_model(self.tokenizer, 1)
@@ -89,31 +135,66 @@ class RayPPOTrainer:
         
 
     @torch.no_grad()
-    async def make_experience(self, rl_data, **generate_kwargs):
+    async def make_experience(self, rl_data, tag="all", **generate_kwargs):
         experiences = []
-
-        import json
 
         prompts_set = []
         response_set = []
         rewards_set = []
-        
-        for i in range(len(rl_data)):
-            prompts_set.append(rl_data[i]["prompt"])
-            response_set.append(rl_data[i]["response"])
-            rewards_set.append(rl_data[i]["reward"])
+        metadata_set = []
+
+        for sample in rl_data:
+            prompt = sample["prompt"]
+            responses = sample.get("responses", [])
+            rewards = sample.get("rewards", [])
+
+            if len(responses) == 0 or len(responses) != len(rewards):
+                continue
+
+            reward_tensor = torch.tensor(rewards, dtype=torch.float32)
+            group_mean = reward_tensor.mean()
+            group_std = reward_tensor.std(unbiased=False)
+            centered = reward_tensor - group_mean
+            if group_std > 1e-6:
+                centered = centered / (group_std + 1e-8)
+
+            for idx, response in enumerate(responses):
+                prompts_set.append(prompt)
+                response_set.append(response)
+                rewards_set.append(centered[idx].item())
+                metadata_set.append(
+                    {
+                        "raw_reward": reward_tensor[idx].item(),
+                        "relative_reward": centered[idx].item(),
+                        "group_mean": group_mean.item(),
+                        "group_std": group_std.item(),
+                        "group_size": len(responses),
+                    }
+                )
+
+        if len(prompts_set) == 0:
+            logger.warning("No valid training samples found in this batch, skipping.")
+            return
 
         if self.cfg.use_compute_reward_fn:
             async with Timer("Calculate custom rewards"):
                 dp_tasks = []
                 reward_fn = partial(self.custom_reward_fn, reward_model_fn=self._warp_custom_reward_model_fn())
-                all_prompts, outputs, custom_rewards = await reward_fn(prompts_set, response_set, rewards_set)
+                all_prompts, outputs, custom_rewards, valid_indices = await reward_fn(
+                    prompts_set, response_set, rewards_set
+                )
+                metadata_set = [metadata_set[i] for i in valid_indices]
                 assert len(all_prompts) == len(
                     outputs
                 ), "generate objects number after custom reward function must be equal to all inputs number"
         else:
-            all_prompts, outputs, custom_rewards = all_prompts, outputs, None
-        
+            all_prompts, outputs, custom_rewards = prompts_set, response_set, None
+
+        if len(all_prompts) == 0:
+            return
+        if metadata_set:
+            assert len(metadata_set) == len(all_prompts), "metadata size must match prompts size"
+
         # 1.3 packing samples
         async with Timer("Packing samples"):
             (
@@ -122,8 +203,13 @@ class RayPPOTrainer:
                 ret_num_actions,
                 ret_packed_seq_lens,
                 ret_custom_rewards,
+                ret_metadata,
             ) = self._convert_prompts_outputs_to_batch_tensors_packing(
-                all_prompts, outputs, custom_rewards, self.cfg.packing_max_len
+                all_prompts,
+                outputs,
+                custom_rewards,
+                self.cfg.packing_max_len,
+                sample_metadata=metadata_set,
             )
             action_masks = None
 
@@ -136,10 +222,19 @@ class RayPPOTrainer:
                 ret_num_actions,
                 ret_packed_seq_lens,
                 ret_custom_rewards,
+                ret_metadata,
             )
             logger.info(f"experiences size: {len(experiences)}")
 
         # 3. calculate advantages and returns / along with tensorboard logging
+
+        avg_custom_rewards = 0
+        avg_response_length = 0
+        avg_advantages = 0
+        avg_advantages_abs = 0
+        avg_group_raw_reward = 0
+        avg_group_relative_reward = 0
+        avg_group_reward_std = 0
 
         async with Timer("Calculate advantages and returns"):
             adv_tasks = []
@@ -148,7 +243,50 @@ class RayPPOTrainer:
 
             for tsk in asyncio.as_completed(adv_tasks):
                 experience, metrics = await tsk
+                avg_custom_rewards += metrics.get("avg_custom_rewards", 0)
+                avg_response_length += metrics.get("avg_response_length", 0)
+                avg_advantages += metrics.get("avg_advantages", 0)
+                avg_advantages_abs += metrics.get("avg_advantages_abs", 0)
+                avg_group_raw_reward += metrics.get("avg_group_raw_reward", 0)
+                avg_group_relative_reward += metrics.get("avg_group_relative_reward", 0)
+                avg_group_reward_std += metrics.get("avg_group_reward_std", 0)
                 self.replay_buffer.append(experience)
+
+        n_exp = max(len(experiences), 1)
+        step_key = self.global_step
+
+        self.writer.add_scalar(f"experience/{tag}/avg_custom_rewards", avg_custom_rewards / n_exp, step_key)
+        self.writer.add_scalar(f"experience/{tag}/avg_response_length", avg_response_length / n_exp, step_key)
+        self.writer.add_scalar(f"experience/{tag}/avg_advantages", avg_advantages / n_exp, step_key)
+        self.writer.add_scalar(f"experience/{tag}/avg_advantages_abs", avg_advantages_abs / n_exp, step_key)
+        self.writer.add_scalar(f"experience/{tag}/avg_group_raw_reward", avg_group_raw_reward / n_exp, step_key)
+        self.writer.add_scalar(f"experience/{tag}/avg_group_relative_reward", avg_group_relative_reward / n_exp, step_key)
+        self.writer.add_scalar(f"experience/{tag}/avg_group_reward_std", avg_group_reward_std / n_exp, step_key)
+        self.writer.flush()
+
+        logger.info(
+            f"[step={self.global_step} tag={tag}] "
+            f"avg_custom_rewards={avg_custom_rewards / n_exp:.4f}, "
+            f"avg_response_length={avg_response_length / n_exp:.1f}, "
+            f"avg_group_raw_reward={avg_group_raw_reward / n_exp:.4f}, "
+            f"avg_group_reward_std={avg_group_reward_std / n_exp:.4f}"
+        )
+        append_jsonl(
+            "policy_metrics.jsonl",
+            {
+                "step": step_key,
+                "profile": get_profile_name(),
+                "tag": tag,
+                "avg_custom_rewards": avg_custom_rewards / n_exp,
+                "avg_response_length": avg_response_length / n_exp,
+                "avg_advantages": avg_advantages / n_exp,
+                "avg_advantages_abs": avg_advantages_abs / n_exp,
+                "avg_group_raw_reward": avg_group_raw_reward / n_exp,
+                "avg_group_relative_reward": avg_group_relative_reward / n_exp,
+                "avg_group_reward_std": avg_group_reward_std / n_exp,
+                "metric_type": "experience",
+            },
+        )
 
 
     @torch.no_grad()
@@ -160,6 +298,7 @@ class RayPPOTrainer:
         num_actions_all: Optional[List[int]],
         packed_seq_lens_all: Optional[List[int]],
         custom_rewards_all: Optional[List[torch.Tensor]],
+        metadata_all: Optional[List[List[dict]]],
     ):
         num_policy_dp_groups = self.cfg.actor_num_nodes * self.cfg.actor_num_gpus_per_node
         num_critic_dp_groups = self.cfg.critic_num_nodes * self.cfg.critic_num_gpus_per_node
@@ -239,6 +378,13 @@ class RayPPOTrainer:
                 "total_length": total_length,
                 "num_actions": num_actions_all[i],
             }
+            if metadata_all is not None:
+                sample_metadata = metadata_all[i]
+                info["group_relative_reward"] = torch.tensor(sum(m["relative_reward"] for m in sample_metadata) / len(sample_metadata), dtype=torch.float32).unsqueeze(0)
+                info["group_raw_reward"] = torch.tensor(sum(m["raw_reward"] for m in sample_metadata) / len(sample_metadata), dtype=torch.float32).unsqueeze(0)
+                info["group_reward_mean"] = torch.tensor(sum(m["group_mean"] for m in sample_metadata) / len(sample_metadata), dtype=torch.float32).unsqueeze(0)
+                info["group_reward_std"] = torch.tensor(sum(m["group_std"] for m in sample_metadata) / len(sample_metadata), dtype=torch.float32).unsqueeze(0)
+                info["group_size"] = torch.tensor(sum(m["group_size"] for m in sample_metadata) / len(sample_metadata), dtype=torch.float32).unsqueeze(0)
             experiences.append(
                 Experience(
                     sequences_all[i],
@@ -328,11 +474,11 @@ class RayPPOTrainer:
     async def ppo_local_train_policy(self, replay_buffers: List[NaiveReplayBuffer], global_steps: int):
         if global_steps > self.cfg.freezing_actor_steps:
             async with Timer("Policy model training"):
-                await self.policy_model.async_ppo_train(global_steps, replay_buffers)
+                status = await self.policy_model.async_ppo_train(global_steps, replay_buffers)
             await self.policy_model.async_run_method("empty_cache")
+            return status[0] if status else None
 
-        if global_steps > self.cfg.freezing_actor_steps:
-            return 
+        return None
 
     async def custom_reward_fn(
         self,
@@ -340,7 +486,7 @@ class RayPPOTrainer:
         outputs: List[Any],
         scores: List[Any],
         reward_model_fn: Callable[[List[str], List[str]], Awaitable[torch.Tensor]],
-    ) -> Tuple[List[str], List[str], List[torch.Tensor]]:
+    ) -> Tuple[List[str], List[str], List[torch.Tensor], List[int]]:
         responses = outputs
         output_tokens = self._tokenize(responses, self.cfg.generate_max_len, padding=False)["input_ids"]
 
@@ -356,13 +502,15 @@ class RayPPOTrainer:
         res_prompts = []
         res_responses = []
         res_score_tensors = []
-        for prompt, response, score_tensor in zip(prompts, responses, score_tensors):
+        valid_indices = []
+        for idx, (prompt, response, score_tensor) in enumerate(zip(prompts, responses, score_tensors)):
             if len(response) > 0:
                 res_prompts.append(prompt)
                 res_responses.append(response)
                 res_score_tensors.append(score_tensor)
+                valid_indices.append(idx)
 
-        return res_prompts, res_responses, res_score_tensors
+        return res_prompts, res_responses, res_score_tensors, valid_indices
 
     @torch.no_grad()
     async def _calc_advantages_and_returns(self, experience: Experience):
@@ -391,18 +539,35 @@ class RayPPOTrainer:
         experience.info["return"] = return_sums
         experience.kl = None
 
+        avg_response_length = experience.info["response_length"].mean().item() if torch.is_tensor(experience.info["response_length"]) else 0
+
+        if experience.info["custom_rewards"] is not None:
+            avg_custom_rewards = torch.stack([r.sum() for r in experience.info["custom_rewards"]]).mean().item()
+        else:
+            avg_custom_rewards = 0
+
+        avg_group_raw_reward = experience.info.get("group_raw_reward", torch.tensor(0.0)).mean().item()
+        avg_group_relative_reward = experience.info.get("group_relative_reward", torch.tensor(0.0)).mean().item()
+        avg_group_reward_std = experience.info.get("group_reward_std", torch.tensor(0.0)).mean().item()
+
         del experience.info["num_actions"]
         del experience.info["custom_rewards"]
         del experience.info["reward"]
         experience.to_device("cpu")
 
-        # for replay buffer split batch
         num_packed_samples = len(num_actions)
         return_sums /= num_packed_samples
-        experience.info["response_length"] = torch.Tensor(experience.info["response_length"]).mean().unsqueeze(0)
-        experience.info["total_length"] = torch.Tensor(experience.info["total_length"]).mean().unsqueeze(0)
+        experience.info["response_length"] = torch.Tensor(experience.info["response_length"]).mean().unsqueeze(0) if not torch.is_tensor(experience.info["response_length"]) or experience.info["response_length"].dim() > 0 else experience.info["response_length"].unsqueeze(0)
+        experience.info["total_length"] = torch.Tensor(experience.info["total_length"]).mean().unsqueeze(0) if not torch.is_tensor(experience.info["total_length"]) or experience.info["total_length"].dim() > 0 else experience.info["total_length"].unsqueeze(0)
 
         metrics = {
+            "avg_custom_rewards": avg_custom_rewards,
+            "avg_response_length": avg_response_length,
+            "avg_advantages": experience.advantages.mean().item(),
+            "avg_advantages_abs": experience.advantages.abs().mean().item(),
+            "avg_group_raw_reward": avg_group_raw_reward,
+            "avg_group_relative_reward": avg_group_relative_reward,
+            "avg_group_reward_std": avg_group_reward_std,
         }
 
         return experience, metrics
@@ -458,7 +623,12 @@ class RayPPOTrainer:
         return sequences, attention_mask, action_mask
 
     def _convert_prompts_outputs_to_batch_tensors_packing(
-        self, prompts: List[str], outputs: List[str], custom_rewards: Optional[List[torch.Tensor]], packing_max_len: int
+        self,
+        prompts: List[str],
+        outputs: List[str],
+        custom_rewards: Optional[List[torch.Tensor]],
+        packing_max_len: int,
+        sample_metadata: Optional[List[dict]] = None,
     ):
         ret_sequences = []
         ret_attention_masks = []
@@ -468,6 +638,10 @@ class RayPPOTrainer:
             ret_custom_rewards = []
         else:
             ret_custom_rewards = None
+        if sample_metadata is not None:
+            ret_metadata = []
+        else:
+            ret_metadata = None
 
         assert (
             len(prompts) == len(outputs) and len(prompts) > 0
@@ -479,6 +653,7 @@ class RayPPOTrainer:
             out_num_actions = []
             out_packed_seq_lens = []
             rewards = [] if custom_rewards else None
+            metadata = [] if sample_metadata is not None else None
             seq_offset = 0
             seq_index = 0
             return (
@@ -487,6 +662,7 @@ class RayPPOTrainer:
                 out_num_actions,
                 out_packed_seq_lens,
                 rewards,
+                metadata,
                 seq_offset,
                 seq_index,
             )
@@ -497,6 +673,7 @@ class RayPPOTrainer:
             out_num_actions,
             out_packed_seq_lens,
             rewards,
+            metadata,
             seq_offset,
             seq_index,
             sequence,
@@ -504,6 +681,7 @@ class RayPPOTrainer:
             num_action,
             total_len,
             custom_rewards,
+            sample_metadata,
             i,
         ):
             out_sequence[seq_offset : seq_offset + total_len] = torch.tensor(sequence)
@@ -512,6 +690,8 @@ class RayPPOTrainer:
             out_packed_seq_lens.append(total_len)
             if custom_rewards:
                 rewards.append(custom_rewards[i])
+            if metadata is not None and sample_metadata is not None:
+                metadata.append(sample_metadata[i])
             return seq_offset + total_len, seq_index + 1
 
         sequences = []
@@ -535,6 +715,7 @@ class RayPPOTrainer:
             out_num_actions,
             out_packed_seq_lens,
             rewards,
+            metadata,
             seq_offset,
             seq_index,
         ) = _new_instance()
@@ -548,6 +729,7 @@ class RayPPOTrainer:
                     out_num_actions,
                     out_packed_seq_lens,
                     rewards,
+                    metadata,
                     seq_offset,
                     seq_index,
                     sequence,
@@ -555,6 +737,7 @@ class RayPPOTrainer:
                     num_action,
                     total_len,
                     custom_rewards,
+                    sample_metadata,
                     i,
                 )
             elif seq_offset + total_len == packing_max_len:
@@ -564,6 +747,7 @@ class RayPPOTrainer:
                     out_num_actions,
                     out_packed_seq_lens,
                     rewards,
+                    metadata,
                     seq_offset,
                     seq_index,
                     sequence,
@@ -571,6 +755,7 @@ class RayPPOTrainer:
                     num_action,
                     total_len,
                     custom_rewards,
+                    sample_metadata,
                     i,
                 )
                 valid_size = out_attention_mask.nonzero().size(0)
@@ -580,12 +765,15 @@ class RayPPOTrainer:
                 ret_packed_seq_lens.append(out_packed_seq_lens)
                 if custom_rewards:
                     ret_custom_rewards.append(rewards)
+                if metadata is not None:
+                    ret_metadata.append(metadata)
                 (
                     out_sequence,
                     out_attention_mask,
                     out_num_actions,
                     out_packed_seq_lens,
                     rewards,
+                    metadata,
                     seq_offset,
                     seq_index,
                 ) = _new_instance()
@@ -598,12 +786,15 @@ class RayPPOTrainer:
                     ret_packed_seq_lens.append(out_packed_seq_lens)
                     if custom_rewards:
                         ret_custom_rewards.append(rewards)
+                    if metadata is not None:
+                        ret_metadata.append(metadata)
                     (
                         out_sequence,
                         out_attention_mask,
                         out_num_actions,
                         out_packed_seq_lens,
                         rewards,
+                        metadata,
                         seq_offset,
                         seq_index,
                     ) = _new_instance()
@@ -613,6 +804,7 @@ class RayPPOTrainer:
                         out_num_actions,
                         out_packed_seq_lens,
                         rewards,
+                        metadata,
                         seq_offset,
                         seq_index,
                         sequence,
@@ -620,6 +812,7 @@ class RayPPOTrainer:
                         num_action,
                         total_len,
                         custom_rewards,
+                        sample_metadata,
                         i,
                     )
 
@@ -631,8 +824,17 @@ class RayPPOTrainer:
             ret_packed_seq_lens.append(out_packed_seq_lens)
             if custom_rewards:
                 ret_custom_rewards.append(rewards)
+            if metadata is not None:
+                ret_metadata.append(metadata)
 
-        return ret_sequences, ret_attention_masks, ret_num_actions, ret_packed_seq_lens, ret_custom_rewards
+        return (
+            ret_sequences,
+            ret_attention_masks,
+            ret_num_actions,
+            ret_packed_seq_lens,
+            ret_custom_rewards,
+            ret_metadata,
+        )
 
     def _get_dp_group_models(self, dp_rank: int, model_type: str = ""):
         model = getattr(self, model_type)
@@ -790,6 +992,7 @@ class RayPPOTrainer:
                     _,
                     packed_seq_lens,
                     _,
+                    _,
                 ) = self._convert_prompts_outputs_to_batch_tensors_packing(
                     prompts, outputs, None, self.cfg.packing_max_len
                 )
@@ -821,5 +1024,4 @@ class RayPPOTrainer:
             return warpped_reward_model_fn
         else:
             return None
-
 

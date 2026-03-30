@@ -10,6 +10,8 @@ import multiprocessing
 from termcolor import cprint
 
 import optimization_config
+from bootstrap_reward_utils import canonicalize_execution_output
+from reporting import append_jsonl, get_current_step, get_profile_name
 
 
 
@@ -129,7 +131,17 @@ def execute_scripts(outputs_name, num_chunks):
     case_input_list = []
     case_output_list = []
     time_limit_list = []
+    public_index_list = []
+    public_position_list = []
+    public_code_list = []
+    public_input_list = []
+    public_output_list = []
+    public_time_limit_list = []
     for i in range(len(data)):
+        data[i].setdefault("example_input", [])
+        data[i].setdefault("example_output", [])
+        data[i].setdefault("test_input", [])
+        data[i].setdefault("test_output", [])
         if len(data[i]["all_case_input"]) * len(data[i]["generated_code"]) == 0:
             data[i]["all_case_exe_results"] = None
             data[i]["all_case_bool_table"] = None
@@ -138,8 +150,17 @@ def execute_scripts(outputs_name, num_chunks):
             n_col = len(data[i]["all_case_input"])
             data[i]["all_case_exe_results"] = [["" for _ in range(n_col)] for _ in range(n_row)]
             data[i]["all_case_bool_table"] = np.full((n_row, n_col), False, dtype=bool)
+        if len(data[i]["example_input"]) * len(data[i]["generated_code"]) == 0:
+            data[i]["public_example_exe_results"] = None
+            data[i]["public_example_bool_table"] = None
+        else:
+            n_row = len(data[i]["generated_code"])
+            n_col = len(data[i]["example_input"])
+            data[i]["public_example_exe_results"] = [["" for _ in range(n_col)] for _ in range(n_row)]
+            data[i]["public_example_bool_table"] = np.full((n_row, n_col), False, dtype=bool)
 
         data_i = data[i]
+        time_limit = data_i["test_time_limit"] if "test_time_limit" in data_i else 1
         for j in range(len(data_i["generated_code"])):
             for k in range(len(data_i["all_case_input"])):
                 code = data_i["generated_code"][j]
@@ -148,18 +169,34 @@ def execute_scripts(outputs_name, num_chunks):
                 code_list.append(code)
                 case_input_list.append(case_input)
                 case_output_list.append(case_output)
-                time_limit_list.append(1)
+                time_limit_list.append(time_limit)
                 index_list.append(i)
                 position_list.append((j, k))
+            for k in range(len(data_i["example_input"])):
+                code = data_i["generated_code"][j]
+                case_input = data_i["example_input"][k]
+                case_output = data_i["example_output"][k]
+                public_code_list.append(code)
+                public_input_list.append(case_input)
+                public_output_list.append(case_output)
+                public_time_limit_list.append(time_limit)
+                public_index_list.append(i)
+                public_position_list.append((j, k))
     
     # execute 
     exe_results = run_scripts_with_chunk(code_list, case_input_list, time_limit_list, worker, num_chunks)
+    public_results = run_scripts_with_chunk(public_code_list, public_input_list, public_time_limit_list, worker, num_chunks) if public_code_list else []
 
     for i in range(len(index_list)):
         index_i = index_list[i]
         j, k = position_list[i]
         data[index_i]["all_case_exe_results"][j][k] = exe_results[i]
         data[index_i]["all_case_bool_table"][j][k] = test_if_eq(exe_results[i], case_output_list[i])
+    for i in range(len(public_index_list)):
+        index_i = public_index_list[i]
+        j, k = public_position_list[i]
+        data[index_i]["public_example_exe_results"][j][k] = public_results[i]
+        data[index_i]["public_example_bool_table"][j][k] = test_if_eq(public_results[i], public_output_list[i])
     
     # get stats
     stats_single = {
@@ -185,49 +222,68 @@ def execute_scripts(outputs_name, num_chunks):
     p_01_num = 0
     p_00_score = 0
     p_00_num = 0
+    total_generated_exec = 0
+    timeout_exec = 0
+    exec_error_exec = 0
+    empty_exec = 0
+    public_example_score = 0
+    public_example_num = 0
     for i in range(len(data)):
         if data[i]["all_case_exe_results"] is None:
             continue
         t = data[i]["num_ground_truth_test"]
-        all_test_table_i = data[i]["all_case_bool_table"][:, :t].copy()
-        all_case_table_i = data[i]["all_case_bool_table"][:, t:].copy()
-        correct_code_list = np.where(all_test_table_i.all(axis=1))[0].tolist()
-        code_score += len(correct_code_list)
-        code_num += all_test_table_i.shape[0]
-        code_acc_score += np.sum(all_test_table_i).item()
-        code_acc_num += all_test_table_i.shape[0] * all_test_table_i.shape[1]
-        sub_case_table_i = all_case_table_i[correct_code_list, :].copy()
-        correct_case_list = np.where(sub_case_table_i.all(axis=0))[0].tolist()
-        if len(correct_code_list) > 0:
-            case_score += len(correct_case_list)
-            case_num += sub_case_table_i.shape[1]
-            case_acc_score += np.sum(sub_case_table_i).item()
-            case_acc_num += sub_case_table_i.shape[0] * sub_case_table_i.shape[1]
-            # get ps
-            wrong_code_list = [j for j in range(all_case_table_i.shape[0]) if j not in correct_code_list]
-            wrong_case_list = [j for j in range(all_case_table_i.shape[1]) if j not in correct_case_list]
-            if len(wrong_code_list) > 0:
-                if len(correct_case_list) > 0:
-                    wrong_code_correct_case_table_i = all_case_table_i[wrong_code_list, :][:, correct_case_list].copy()
-                    p_01_score += np.sum(~wrong_code_correct_case_table_i).item()
-                    p_01_num += wrong_code_correct_case_table_i.shape[0] * wrong_code_correct_case_table_i.shape[1]
-                if len(wrong_case_list) > 0:
-                    wrong_code_wrong_case_table_i = all_case_table_i[wrong_code_list, :][:, wrong_case_list].copy()
-                    p_00_score += np.sum(wrong_code_wrong_case_table_i).item()
-                    p_00_num += wrong_code_wrong_case_table_i.shape[0] * wrong_code_wrong_case_table_i.shape[1]
-        
-        index_id = 0
-        for scale_num_code, scale_num_case in scale_tuple_list:
-            case_table_i = all_case_table_i[:scale_num_code, :scale_num_case].copy()
-            test_table_i = all_test_table_i[:scale_num_code, :].copy()
-            best_code_index = np.sum(case_table_i, 1).argmax()
-            sub_test_table_i = test_table_i[best_code_index, :].copy()
-            stats[index_id]["BoN_score"] = stats[index_id]["BoN_score"] + int(all(sub_test_table_i))
-            stats[index_id]["BoN_num"] = stats[index_id]["BoN_num"] + 1
-            stats[index_id]["BoN_acc_score"] = stats[index_id]["BoN_acc_score"] + np.sum(sub_test_table_i).item()
-            stats[index_id]["BoN_acc_num"] = stats[index_id]["BoN_acc_num"] + len(sub_test_table_i)
-            assert int(all(sub_test_table_i)) / 1 <= np.sum(sub_test_table_i).item() / len(sub_test_table_i), "error"
-            index_id += 1
+        all_bool_table_i = np.array(data[i]["all_case_bool_table"])
+        all_test_table_i = all_bool_table_i[:, :t].copy()
+        all_case_table_i = all_bool_table_i[:, t:].copy()
+        gen_results_i = np.array(data[i]["all_case_exe_results"], dtype=object)[:, t:].copy()
+        gen_labels_i = np.vectorize(canonicalize_execution_output)(gen_results_i) if gen_results_i.size else np.array([])
+        total_generated_exec += gen_labels_i.size
+        timeout_exec += int(np.sum(gen_labels_i == "__TIMEOUT__"))
+        exec_error_exec += int(np.sum(gen_labels_i == "__EXEC_ERROR__"))
+        empty_exec += int(np.sum(gen_labels_i == "__EMPTY__"))
+        if data[i]["public_example_bool_table"] is not None:
+            public_table_i = np.array(data[i]["public_example_bool_table"])
+            public_example_score += int(np.sum(public_table_i))
+            public_example_num += int(public_table_i.size)
+        if t > 0:
+            correct_code_list = np.where(all_test_table_i.all(axis=1))[0].tolist()
+            code_score += len(correct_code_list)
+            code_num += all_test_table_i.shape[0]
+            code_acc_score += np.sum(all_test_table_i).item()
+            code_acc_num += all_test_table_i.shape[0] * all_test_table_i.shape[1]
+            sub_case_table_i = all_case_table_i[correct_code_list, :].copy()
+            correct_case_list = np.where(sub_case_table_i.all(axis=0))[0].tolist()
+            if len(correct_code_list) > 0:
+                case_score += len(correct_case_list)
+                case_num += sub_case_table_i.shape[1]
+                case_acc_score += np.sum(sub_case_table_i).item()
+                case_acc_num += sub_case_table_i.shape[0] * sub_case_table_i.shape[1]
+                wrong_code_list = [j for j in range(all_case_table_i.shape[0]) if j not in correct_code_list]
+                wrong_case_list = [j for j in range(all_case_table_i.shape[1]) if j not in correct_case_list]
+                if len(wrong_code_list) > 0:
+                    if len(correct_case_list) > 0:
+                        wrong_code_correct_case_table_i = all_case_table_i[wrong_code_list, :][:, correct_case_list].copy()
+                        p_01_score += np.sum(~wrong_code_correct_case_table_i).item()
+                        p_01_num += wrong_code_correct_case_table_i.shape[0] * wrong_code_correct_case_table_i.shape[1]
+                    if len(wrong_case_list) > 0:
+                        wrong_code_wrong_case_table_i = all_case_table_i[wrong_code_list, :][:, wrong_case_list].copy()
+                        p_00_score += np.sum(wrong_code_wrong_case_table_i).item()
+                        p_00_num += wrong_code_wrong_case_table_i.shape[0] * wrong_code_wrong_case_table_i.shape[1]
+            index_id = 0
+            for scale_num_code, scale_num_case in scale_tuple_list:
+                case_table_i = all_case_table_i[:scale_num_code, :scale_num_case].copy()
+                test_table_i = all_test_table_i[:scale_num_code, :].copy()
+                if case_table_i.size == 0 or test_table_i.size == 0:
+                    index_id += 1
+                    continue
+                best_code_index = np.sum(case_table_i, 1).argmax()
+                sub_test_table_i = test_table_i[best_code_index, :].copy()
+                stats[index_id]["BoN_score"] = stats[index_id]["BoN_score"] + int(all(sub_test_table_i))
+                stats[index_id]["BoN_num"] = stats[index_id]["BoN_num"] + 1
+                stats[index_id]["BoN_acc_score"] = stats[index_id]["BoN_acc_score"] + np.sum(sub_test_table_i).item()
+                stats[index_id]["BoN_acc_num"] = stats[index_id]["BoN_acc_num"] + len(sub_test_table_i)
+                assert int(all(sub_test_table_i)) / 1 <= np.sum(sub_test_table_i).item() / len(sub_test_table_i), "error"
+                index_id += 1
 
     os.makedirs(os.path.dirname("./results/results-" + outputs_name + ".txt"), exist_ok=True)
     with open("./results/results-" + outputs_name + ".txt", "a") as f:
@@ -256,9 +312,32 @@ def execute_scripts(outputs_name, num_chunks):
         for i in range(len(stats)):
             tuple_name = stats[i]["tuple"]
             save_and_print(f"BoN setting {tuple_name}:")
-            acc = stats[i]["BoN_score"] / stats[i]["BoN_num"]
-            acc_acc = stats[i]["BoN_acc_score"] / stats[i]["BoN_acc_num"]
+            acc = safe_divide(stats[i]["BoN_score"], stats[i]["BoN_num"])
+            acc_acc = safe_divide(stats[i]["BoN_acc_score"], stats[i]["BoN_acc_num"])
             save_and_print(f"acc: {acc}, accumulate acc: {acc_acc}")
+
+    def safe_divide(d1, d2):
+        if d2 == 0:
+            return 0
+        return d1 / d2
+
+    append_jsonl(
+        "execute_step_metrics.jsonl",
+        {
+            "step": get_current_step(),
+            "profile": get_profile_name(),
+            "problems": len(data),
+            "generated_exec_total": total_generated_exec,
+            "timeout_rate": safe_divide(timeout_exec, total_generated_exec),
+            "exec_error_rate": safe_divide(exec_error_exec, total_generated_exec),
+            "empty_exec_rate": safe_divide(empty_exec, total_generated_exec),
+            "public_example_coverage": safe_divide(
+                sum(1 for item in data if item.get("public_example_bool_table") is not None),
+                len(data),
+            ),
+            "public_example_acc": safe_divide(public_example_score, public_example_num),
+        },
+    )
 
 
     # convert np to list
@@ -266,6 +345,8 @@ def execute_scripts(outputs_name, num_chunks):
         if data[i]["all_case_exe_results"] is None:
             continue
         data[i]["all_case_bool_table"] = data[i]["all_case_bool_table"].tolist()
+        if data[i]["public_example_bool_table"] is not None:
+            data[i]["public_example_bool_table"] = data[i]["public_example_bool_table"].tolist()
 
     # output the data
     os.makedirs(os.path.dirname("./temp_data/outputs-" + outputs_name + ".json"), exist_ok=True)
@@ -297,8 +378,6 @@ outputs_name = "rl-" + pretrained_model.replace("/", ".") + "-" + dataset
 
 # execute
 execute_scripts(outputs_name, num_chunks)
-
-
 
 
 

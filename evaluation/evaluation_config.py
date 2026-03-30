@@ -143,5 +143,3 @@ special_requirements = """You should use input() to input and print() to output 
 
 
 
-
-

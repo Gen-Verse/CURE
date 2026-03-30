@@ -1,0 +1,21 @@
+================================================================================
+  CURE 复现实验: Baseline vs Trained 对比表
+================================================================================
+
+Metric                     Baseline (Step 0)          Best Eval  Eval Step
+---------------------------------------------------------------------------
+Code Accuracy                         0.2062             0.2315        200
+Code Accumulate Acc                   0.2699             0.3208        200
+UT Accuracy                           0.1458             0.3159        200
+UT Accumulate Acc                     0.2225             0.3877        200
+p_01                                  0.2647             0.3143        200
+p_00                                  0.0026             0.0527        200
+BoN(4,4) Acc                          0.2000             0.2312        200
+BoN(16,16) Acc                        0.2000             0.2904        200
+Code Resp Length                       683.7              479.9        200
+Case Resp Length                       886.4              642.5        200
+
+---------------------------------------------------------------------------
+Note: Baseline uses Step 0 training-set metrics (not eval-set).
+      Best Eval is the checkpoint with highest code_acc on CodeContests eval.
+      To get a true baseline, run eval.py on the pretrained model.
